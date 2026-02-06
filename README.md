@@ -1,183 +1,85 @@
-# Cloning Your Framer Website (extractom.com.tr)
+# Framer Cloner
 
-This guide provides multiple methods to clone your Framer website for static hosting.
+Clone any [Framer](https://www.framer.com/) website into a fully static, self-contained site that can be hosted anywhere.
 
-## Why httrack Failed
+Framer sites rely heavily on JavaScript rendering and load images from `framerusercontent.com`. Traditional scrapers like wget or httrack can't handle this. Framer Cloner uses a headless browser to render every page, then downloads all assets and rewrites every URL so the result works completely offline.
 
-Framer websites use extensive JavaScript to load content and images dynamically from their CDN (`framerusercontent.com`). Traditional scrapers like httrack can't execute JavaScript, so they miss most images and dynamic content.
+## Why
 
-## Recommended Methods
+I needed to move a Framer site to static hosting and quickly discovered there are no free tools that can do this properly. Framer sites are JavaScript-heavy SPAs that load everything dynamically from their CDN, so traditional scrapers just produce broken pages with missing images. After getting frustrated with wget, httrack, and various online "website downloaders" all failing, I wrote this simple script with the help of Claude to just get it done.
 
-### Method 1: Python with requests-html (EASIEST)
+## What it does
 
-**Best for**: Quick cloning with minimal setup
+- Renders each page with a real Chrome browser (via Puppeteer)
+- Crawls the site automatically starting from the homepage — no need to list pages manually
+- Discovers CMS / detail pages (e.g. `/products/some-item`, `/blog/some-post`)
+- Downloads all images, JS bundles, and other assets from `framerusercontent.com`
+- Rewrites HTML so every link and asset reference points to a local file
+- Converts SPA-style navigation links (`./products`) to static file links (`./products.html`)
+- Handles responsive `srcset` image variants (`?scale-down-to=512`, etc.)
+
+## Requirements
+
+- [Node.js](https://nodejs.org/) (v18+)
+- Google Chrome or Chromium (Puppeteer will use its bundled Chromium by default)
+
+## Setup
 
 ```bash
-# Install dependencies
-pip install requests-html
-
-# Run the script
-python3 clone_framer_site.py
+git clone <this-repo>
+cd framer-cloner
+npm install
 ```
 
-**Pros**: 
-- Simple to use
-- Executes JavaScript
-- Downloads all assets
-
-**Cons**: 
-- Slower than wget
-- Requires Python dependencies
-
----
-
-### Method 2: Node.js with Puppeteer (MOST RELIABLE)
-
-**Best for**: Complete accuracy and control
+## Usage
 
 ```bash
-# Install dependencies
-npm init -y
-npm install puppeteer
-
-# Run the script
-node clone_framer_puppeteer.js
+npm run clone "https://example.com"
 ```
 
-**Pros**: 
-- Uses real Chrome browser
-- Perfect JavaScript rendering
-- Most accurate results
+The cloned site is saved to `out/<domain>/`, for example:
 
-**Cons**: 
-- Larger dependency (Chromium download)
-- Slower execution
-
----
-
-### Method 3: wget (FASTEST, BUT LIMITED)
-
-**Best for**: Quick download if you just need HTML structure
-
-```bash
-chmod +x clone_framer_site.sh
-./clone_framer_site.sh
+```
+out/example_com/
+  index.html
+  products.html
+  products/
+    some-item.html
+  blog/
+    some-post.html
+  assets/
+    images/
+    sites/
 ```
 
-**Pros**: 
-- Very fast
-- No dependencies
-- Simple
-
-**Cons**: 
-- May miss some JavaScript-loaded content
-- Requires manual fixing of links
-
----
-
-### Method 4: SingleFile Browser Extension (MANUAL)
-
-**Best for**: One-page cloning or visual verification
-
-1. Install SingleFile extension in Chrome/Firefox
-2. Visit each page on extractom.com.tr
-3. Click the SingleFile icon to save complete page
-4. Repeat for each page you need
-
-**Pros**: 
-- Perfect capture of rendered page
-- No coding required
-- Visual verification
-
-**Cons**: 
-- Manual process for each page
-- Time-consuming for large sites
-
----
-
-## After Cloning
-
-### Fix Absolute URLs
-
-Framer assets use absolute URLs. You'll need to either:
-
-1. **Keep the Framer CDN links** (requires internet)
-2. **Replace framerusercontent.com URLs** with local paths:
+Serve it locally to verify:
 
 ```bash
-# Example: Replace CDN URLs with local paths
-find . -name "*.html" -type f -exec sed -i 's|https://framerusercontent.com|./assets|g' {} +
-```
-
-### Test Locally
-
-```bash
-cd extractom_static
+cd out/example_com
 python3 -m http.server 8000
-# Visit http://localhost:8000
+# open http://localhost:8000
 ```
 
-### Deploy to Static Hosting
+## Deploy
 
-Once cloned and tested, you can deploy to:
-- **Netlify**: Drag & drop the folder
-- **Vercel**: `vercel deploy`
-- **GitHub Pages**: Push to gh-pages branch
-- **AWS S3**: `aws s3 sync . s3://your-bucket/`
+The output is plain static HTML/CSS/JS. Host it anywhere:
 
----
+- **Netlify** — drag and drop the output folder
+- **Vercel** — `cd out/example_com && vercel deploy`
+- **GitHub Pages** — push the output folder to a `gh-pages` branch
+- **AWS S3** — `aws s3 sync out/example_com s3://your-bucket/`
+- **Any web server** — just serve the folder
 
-## Pages to Clone
+## Status
 
-Your main pages:
-- `/` (Homepage)
-- `/scfe` (Technology)
-- `/products`
-- `/blog`
-- `/contact`
-- `/privacy-policy`
-- `/cookie-policy`
-- `/brochure`
+This tool works as of February 2026. Framer may change their hosting infrastructure or asset delivery at any time, which could require updates to this tool.
 
-Plus any blog posts under `/blog/*`
+## Limitations
 
----
+- Only clones pages reachable via `<a href>` links from the homepage. Pages that require JavaScript interaction (e.g. infinite scroll, "load more" buttons) to reveal links may be missed.
+- Framer animations and client-side interactions won't work in the static clone — the cloned JS bundles are downloaded but may not function identically outside of Framer's hosting.
+- Very large sites will take a while since each page is rendered in a real browser.
 
-## Troubleshooting
+## License
 
-### Images Not Loading
-- Check if images are still hosted on framerusercontent.com
-- Verify image paths in the HTML match your local structure
-- Check browser console for 404 errors
-
-### JavaScript Not Working
-- Some Framer animations/interactions may not work offline
-- Consider keeping some Framer JS libraries
-- Test each page individually
-
-### Large File Sizes
-- Framer sites can be 50-500MB due to images
-- Consider optimizing images with tools like:
-  - `imagemagick` for batch conversion
-  - Online tools like TinyPNG
-  - WebP conversion for better compression
-
----
-
-## Alternative: Framer Export
-
-If you have access to the Framer project file:
-1. Open project in Framer
-2. Go to Publish settings
-3. Click "Export as HTML"
-4. This gives you clean, optimized static files
-
----
-
-## Need Help?
-
-If you encounter issues:
-1. Check the browser console for errors
-2. Verify all assets downloaded correctly
-3. Test in a clean browser (incognito mode)
-4. Compare with live site side-by-side
+MIT

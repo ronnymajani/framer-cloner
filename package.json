@@ -1,7 +1,7 @@
 {
-  "name": "framer-site-cloner",
+  "name": "framer-cloner",
   "version": "1.0.0",
-  "description": "Clone Framer website with Puppeteer",
+  "description": "Clone any Framer website into a fully static, self-contained site",
   "main": "clone_framer_puppeteer.js",
   "scripts": {
     "clone": "node clone_framer_puppeteer.js"
