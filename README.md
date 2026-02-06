@@ -21,7 +21,13 @@ I needed to move a Framer site to static hosting and quickly discovered there ar
 ## Requirements
 
 - [Node.js](https://nodejs.org/) (v18+)
-- Google Chrome or Chromium (Puppeteer will use its bundled Chromium by default)
+- Google Chrome or Chromium
+
+Puppeteer installs a bundled Chromium automatically during `npm install`. The script will also detect and prefer a local Chrome or Chromium installation if available. If the bundled browser fails to launch (e.g. compatibility issues on newer macOS), you can install a fresh one with:
+
+```bash
+npx @puppeteer/browsers install chrome@stable
+```
 
 ## Setup
 

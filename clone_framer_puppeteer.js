@@ -24,10 +24,27 @@ if (!siteUrl) {
 
 const parsed = new URL(siteUrl);
 const BASE_URL = parsed.origin; // e.g. https://extractom.com.tr
+const escapedBaseUrl = BASE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Derive output directory: out/<host_with_underscores>
+// Derive output directory: out/<host_with_underscores> (append _2, _3, etc. if it exists)
 const sanitizedHost = parsed.host.replace(/[^a-zA-Z0-9]/g, "_");
-const OUTPUT_DIR = path.join("out", sanitizedHost);
+let OUTPUT_DIR = path.join("out", sanitizedHost);
+try {
+  require("fs").accessSync(OUTPUT_DIR);
+  let n = 2;
+  while (true) {
+    const candidate = path.join("out", `${sanitizedHost}_${n}`);
+    try {
+      require("fs").accessSync(candidate);
+      n++;
+    } catch {
+      OUTPUT_DIR = candidate;
+      break;
+    }
+  }
+} catch {
+  // directory doesn't exist yet, use as-is
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -125,17 +142,34 @@ function getPageDepth(pagePath) {
 }
 
 /**
- * Scan the rendered HTML for internal links (href="./…") and return page paths.
+ * Scan the rendered HTML for internal links and return page paths.
+ * Handles both relative (href="./path") and absolute (href="https://domain/path") links.
  */
 function discoverLinks(html) {
-  const re = /href="\.\/([^"#]*?)"/g;
   const paths = new Set();
   let m;
-  while ((m = re.exec(html)) !== null) {
+
+  // Relative links: href="./something"
+  const relRe = /href="\.\/([^"#]*?)"/g;
+  while ((m = relRe.exec(html)) !== null) {
     const p = m[1];
     if (!p || p.startsWith("assets/") || p.includes("://")) continue;
     paths.add("/" + p);
   }
+
+  // Absolute links on the same domain: href="https://example.com/something"
+  const absRe = new RegExp(`href="${escapedBaseUrl}(/[^"#]*?)"`, "g");
+  while ((m = absRe.exec(html)) !== null) {
+    const p = m[1];
+    if (p && p !== "/") paths.add(p);
+  }
+
+  // Also catch the root absolute link
+  const rootRe = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
+  while ((m = rootRe.exec(html)) !== null) {
+    paths.add("/");
+  }
+
   return [...paths];
 }
 
@@ -169,18 +203,75 @@ function rewriteHtml(html, assetUrlMap, allPagePaths, depth) {
   for (const pagePath of sortedPaths) {
     const clean = pagePath.replace(/^\//, "");
     if (!clean) continue;
+
+    // Relative links: href="./path" → href="./path.html"
     result = result
       .split(`href="./${clean}"`)
       .join(`href="${prefix}${clean}.html"`);
+
+    // Absolute same-domain links: href="https://example.com/path" → href="./path.html"
+    result = result
+      .split(`href="${BASE_URL}/${clean}"`)
+      .join(`href="${prefix}${clean}.html"`);
   }
 
-  // 3. Root link: href="./" → index.html
+  // 3. Root links
+  //    Relative: href="./" → index.html
   result = result.replace(/href="\.\/"/g, `href="${prefix}index.html"`);
+  //    Absolute: href="https://example.com/" and href="https://example.com"
+  const rootWithSlash = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
+  result = result.replace(rootWithSlash, `href="${prefix}index.html"`);
 
   // 4. Anchor links on root: href="./#x" → index.html#x
   result = result.replace(
     /href="\.\/(#[^"]+)"/g,
     `href="${prefix}index.html$1"`,
+  );
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Strip Framer SPA / hydration scripts to preserve SSR content and animations
+// ---------------------------------------------------------------------------
+
+function stripFramerSpa(html) {
+  let result = html;
+
+  // Remove the main Framer bundle that hydrates/re-renders the page via React.
+  // This prevents the SPA router from taking over and breaking the static clone.
+  result = result.replace(
+    /<script[^>]*data-framer-bundle="main"[^>]*><\/script>/g,
+    "",
+  );
+
+  // Remove the Framer appear-animation reducer script — it sets elements to
+  // invisible waiting for JS animations. Without the SPA bundle those animations
+  // never fire, so the elements stay hidden. Removing it keeps everything visible.
+  result = result.replace(
+    /<script[^>]*data-framer-appear-animation[^>]*>[\s\S]*?<\/script>/g,
+    "",
+  );
+
+  // Remove Framer analytics / events script
+  result = result.replace(
+    /<script[^>]*src="https:\/\/events\.framer\.com\/[^"]*"[^>]*><\/script>/g,
+    "",
+  );
+
+  // Remove the hydration data attribute so no stale React state is referenced
+  result = result.replace(/\s*data-framer-hydrate-v2="[^"]*"/g, "");
+
+  // Remove inline scripts that depend on the SPA bundle (nested-link handlers,
+  // breakpoint rewriters, etc.) — they reference functions from the removed bundle.
+  // These are the anonymous inline <script>(()=>{...})()</script> blocks at the end.
+  result = result.replace(
+    /<script>\(\(\)=>\{function u\(\)\{function n\([\s\S]*?<\/script>/g,
+    "",
+  );
+  result = result.replace(
+    /<script>\(\(\)=>\{function i\(\)\{for[\s\S]*?<\/script>/g,
+    "",
   );
 
   return result;
@@ -225,6 +316,9 @@ async function clonePage(browser, pagePath) {
   const allPaths = [...clonedPages, ...pageQueue];
   content = rewriteHtml(content, assetUrlMap, allPaths, getPageDepth(pagePath));
 
+  // Strip Framer SPA scripts so the static SSR HTML stays intact
+  content = stripFramerSpa(content);
+
   // Save
   const filename = pagePathToFile(pagePath);
   const filepath = path.join(OUTPUT_DIR, filename);
@@ -253,16 +347,14 @@ async function main() {
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
   ];
-  const localChrome =
-    chromeArgs &&
-    chromePaths.find((p) => {
-      try {
-        require("fs").accessSync(p);
-        return true;
-      } catch {
-        return false;
-      }
-    });
+  const localChrome = chromePaths.find((p) => {
+    try {
+      require("fs").accessSync(p);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 
   const launchOptions = {
     headless: "new",
@@ -304,13 +396,22 @@ async function main() {
       for (const otherPath of sortedPaths) {
         const clean = otherPath.replace(/^\//, "");
         if (!clean) continue;
+
+        // Relative
         content = content
           .split(`href="./${clean}"`)
+          .join(`href="${prefix}${clean}.html"`);
+
+        // Absolute same-domain
+        content = content
+          .split(`href="${BASE_URL}/${clean}"`)
           .join(`href="${prefix}${clean}.html"`);
       }
 
       // Root & anchor links
       content = content.replace(/href="\.\/"/g, `href="${prefix}index.html"`);
+      const rootWithSlash = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
+      content = content.replace(rootWithSlash, `href="${prefix}index.html"`);
       content = content.replace(
         /href="\.\/(#[^"]+)"/g,
         `href="${prefix}index.html$1"`,
