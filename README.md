@@ -2,14 +2,6 @@
 
 This guide provides multiple methods to clone your Framer website for static hosting.
 
-## Prerequisites
-
-For Method 2 (Puppeteer), you'll need Bun installed:
-```bash
-# Install Bun (if you don't have it)
-curl -fsSL https://bun.sh/install | bash
-```
-
 ## Why httrack Failed
 
 Framer websites use extensive JavaScript to load content and images dynamically from their CDN (`framerusercontent.com`). Traditional scrapers like httrack can't execute JavaScript, so they miss most images and dynamic content.
@@ -39,27 +31,27 @@ python3 clone_framer_site.py
 
 ---
 
-### Method 2: Bun with Puppeteer (MOST RELIABLE & FASTEST)
+### Method 2: Node.js with Puppeteer (MOST RELIABLE)
 
-**Best for**: Complete accuracy with blazing fast performance
+**Best for**: Complete accuracy and control
 
 ```bash
 # Install dependencies
-bun install
+npm init -y
+npm install puppeteer
 
 # Run the script
-bun run clone
+node clone_framer_puppeteer.js
 ```
 
 **Pros**: 
 - Uses real Chrome browser
 - Perfect JavaScript rendering
 - Most accurate results
-- Much faster than Node.js
 
 **Cons**: 
-- Requires Bun runtime
 - Larger dependency (Chromium download)
+- Slower execution
 
 ---
 
