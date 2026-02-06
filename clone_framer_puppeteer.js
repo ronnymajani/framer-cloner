@@ -264,19 +264,17 @@ function patchFramerScripts(html) {
     "",
   );
 
-  // Three-part injection that runs early in <head>:
-  // 1. Intercept fetch for .framercms CMS data files — return valid empty binary
-  //    (4 zero bytes = uint32 count of 0 items). These files are CloudFront-protected
-  //    and unavailable locally. SSR HTML already has all rendered CMS content.
-  // 2. Capture-phase click interceptor — forces full page loads for cross-page links,
+  // 1. Fetch interceptor for CMS data files (.framercms). Returns a never-resolving
+  //    promise so React Suspense keeps the SSR DOM intact (treats it as "still loading").
+  //    This preserves all pre-rendered CMS content AND Framer Motion animations.
+  // 2. Capture-phase click interceptor forces full page loads for cross-page links,
   //    running BEFORE the Framer SPA router can intercept and try client-side navigation.
   // 3. pushState override as fallback for programmatic navigation.
   const routerPatch = `<script>(function(){` +
-    // Fetch interceptor for CMS data
+    // Fetch interceptor — never-resolving promise for CMS data
     `var _f=window.fetch;window.fetch=function(u,o){` +
-    `var s=typeof u==="string"?u:u&&u.url||"";` +
-    `if(s.indexOf(".framercms")!==-1){` +
-    `return Promise.resolve(new Response(new ArrayBuffer(4),{status:200,headers:{"content-type":"application/octet-stream"}}))}` +
+    `var s=typeof u==="string"?u:(u&&u.url||"");` +
+    `if(s.indexOf(".framercms")!==-1)return new Promise(function(){});` +
     `return _f.call(this,u,o)};` +
     // Capture-phase click interceptor — runs before SPA router
     `document.addEventListener("click",function(e){` +
@@ -482,62 +480,10 @@ async function main() {
       modified = true;
     }
 
-    // Make CMS scanItems fail gracefully (returns [] on fetch error instead
-    // of crashing React). CMS data is only needed for SPA navigation which
-    // we've disabled; SSR HTML already has all rendered content.
-    if (content.includes("scanItems()")) {
-      // Pattern: return s}),this.itemsPromise} → return s}).catch(()=>[]),this.itemsPromise}
-      content = content.replace(
-        /return (\w)\}\),this\.itemsPromise\}/g,
-        "return $1}).catch(()=>[]),this.itemsPromise}",
-      );
-      // Variant with double-paren (Promise.all pattern)
-      content = content.replace(
-        /return (\w)\}\)\),this\.itemsPromise\}/g,
-        "return $1})).catch(()=>[]),this.itemsPromise}",
-      );
-      modified = true;
-    }
-
-    // Make CMS batch/range fetch fail gracefully instead of throwing
-    if (/\.status!==200\)throw Error/.test(content)) {
-      content = content.replace(
-        /if\((\w+)\.status!==200\)throw Error\([^)]+\)/g,
-        "if($1.status!==200)return e.map(()=>({pointer:\"\",data:{}}))",
-      );
-      modified = true;
-    }
-
-    // Make compression dictionary fetch fail gracefully (returns null instead
-    // of throwing). Some CMS chunks use a compression dictionary for data;
-    // when unavailable, returning null lets the code degrade gracefully.
-    if (content.includes("Compression dictionary request failed")) {
-      content = content.replace(
-        /if\(!(\w+)\.ok\)throw Error\(`Compression dictionary request failed[^`]*`\)/g,
-        "if(!$1.ok)return null",
-      );
-      modified = true;
-    }
-
-    // Wrap CMS loadModel in try-catch so index fetch/parse errors don't crash React.
-    // Pattern: async loadModel(){BODY}async getModel()
-    if (content.includes("async loadModel(){")) {
-      content = content.replace(
-        /async loadModel\(\)\{(.*?)\}(async getModel\(\))/g,
-        "async loadModel(){try{$1}catch(e){return null}}$2",
-      );
-      modified = true;
-    }
-
-    // Wrap CMS lookupItems in try-catch so query errors return empty instead of crashing.
-    // Pattern: async lookupItems(ARGS){BODY}queryEquals(
-    if (content.includes("async lookupItems(")) {
-      content = content.replace(
-        /async lookupItems\((\w+)\)\{(.*?)\}(queryEquals\()/g,
-        "async lookupItems($1){try{$2}catch(e){return[]}}$3",
-      );
-      modified = true;
-    }
+    // NOTE: Individual CMS patches (scanItems, loadModel, lookupItems, compression
+    // dict, batch fetch) are NOT needed. The HTML fetch interceptor returns a
+    // never-resolving promise for .framercms URLs, so CMS code never reaches
+    // error paths — React Suspense keeps SSR DOM intact.
 
     if (modified) {
       await fs.writeFile(mjsFile, content);
