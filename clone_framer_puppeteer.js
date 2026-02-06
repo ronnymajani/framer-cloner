@@ -128,7 +128,10 @@ async function downloadAsset(url) {
 
 function findFramerUrls(html) {
   const re = /https:\/\/framerusercontent\.com\/[^"'\s)}\]>]+/g;
-  return [...new Set(html.match(re) || [])];
+  const matches = html.match(re) || [];
+  // Filter out bare directory URLs (ending with /) — they're base URL references,
+  // not downloadable files, and would conflict with actual file paths.
+  return [...new Set(matches)].filter((u) => !u.endsWith("/"));
 }
 
 function pagePathToFile(pagePath) {
