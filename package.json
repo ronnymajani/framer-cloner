@@ -1,0 +1,15 @@
+{
+  "name": "framer-site-cloner",
+  "version": "1.0.0",
+  "description": "Clone Framer website with Puppeteer and Bun",
+  "type": "module",
+  "main": "clone_framer_puppeteer.js",
+  "scripts": {
+    "clone": "bun run clone_framer_puppeteer.js",
+    "serve": "bun run server.ts",
+    "install": "bun install"
+  },
+  "dependencies": {
+    "puppeteer": "^21.0.0"
+  }
+}
