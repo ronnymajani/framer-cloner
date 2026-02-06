@@ -83,7 +83,7 @@ This tool works as of February 2026. Framer may change their hosting infrastruct
 ## Limitations
 
 - Only clones pages reachable via `<a href>` links from the homepage. Pages that require JavaScript interaction (e.g. infinite scroll, "load more" buttons) to reveal links may be missed.
-- Framer animations and client-side interactions won't work in the static clone — the cloned JS bundles are downloaded but may not function identically outside of Framer's hosting.
+- Framer animations (scroll, hover, entrance) are preserved via the original JS bundles. The SPA router is patched so navigation does normal page loads instead of client-side routing. Some complex interactions may not work identically outside of Framer's hosting.
 - Very large sites will take a while since each page is rendered in a real browser.
 
 ## License

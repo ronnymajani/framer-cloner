@@ -232,46 +232,57 @@ function rewriteHtml(html, assetUrlMap, allPagePaths, depth) {
 }
 
 // ---------------------------------------------------------------------------
-// Strip Framer SPA / hydration scripts to preserve SSR content and animations
+// Patch Framer scripts — keep the JS bundle for animations but disable the
+// SPA router so navigation uses normal browser page loads (.html files).
 // ---------------------------------------------------------------------------
 
-function stripFramerSpa(html) {
+function patchFramerScripts(html) {
   let result = html;
 
-  // Remove the main Framer bundle that hydrates/re-renders the page via React.
-  // This prevents the SPA router from taking over and breaking the static clone.
-  result = result.replace(
-    /<script[^>]*data-framer-bundle="main"[^>]*><\/script>/g,
-    "",
-  );
-
-  // Remove the Framer appear-animation reducer script — it sets elements to
-  // invisible waiting for JS animations. Without the SPA bundle those animations
-  // never fire, so the elements stay hidden. Removing it keeps everything visible.
-  result = result.replace(
-    /<script[^>]*data-framer-appear-animation[^>]*>[\s\S]*?<\/script>/g,
-    "",
-  );
-
-  // Remove Framer analytics / events script
+  // Remove Framer analytics / events script (not needed for static clone)
   result = result.replace(
     /<script[^>]*src="https:\/\/events\.framer\.com\/[^"]*"[^>]*><\/script>/g,
     "",
   );
 
-  // Remove the hydration data attribute so no stale React state is referenced
-  result = result.replace(/\s*data-framer-hydrate-v2="[^"]*"/g, "");
-
-  // Remove inline scripts that depend on the SPA bundle (nested-link handlers,
-  // breakpoint rewriters, etc.) — they reference functions from the removed bundle.
-  // These are the anonymous inline <script>(()=>{...})()</script> blocks at the end.
+  // Remove the editor bar import (https://edit.framer.com/init.mjs) — it's only
+  // for the Framer in-browser editor and will fail on a static host.
   result = result.replace(
-    /<script>\(\(\)=>\{function u\(\)\{function n\([\s\S]*?<\/script>/g,
-    "",
+    /import\("https:\/\/edit\.framer\.com\/init\.mjs"\)/g,
+    "Promise.resolve({createEditorBar:()=>()=>null})",
   );
+
+  // Inject a small script BEFORE the main Framer bundle that disables the SPA
+  // router. Framer's router uses history.pushState to intercept navigation.
+  // By overriding pushState/replaceState to do a real page load instead, clicks
+  // on <a> tags fall through to normal browser navigation hitting our .html files.
+  const routerPatch = `<script>
+(function() {
+  // Let the Framer bundle hydrate for animations, but intercept any SPA
+  // navigation so the browser does a real page load to our .html files.
+  var origPush = history.pushState;
+  var origReplace = history.replaceState;
+  history.pushState = function(state, title, url) {
+    if (url && typeof url === 'string') {
+      window.location.href = url;
+      return;
+    }
+    origPush.call(this, state, title, url);
+  };
+  history.replaceState = function(state, title, url) {
+    if (url && typeof url === 'string' && url !== window.location.href) {
+      window.location.href = url;
+      return;
+    }
+    origReplace.call(this, state, title, url);
+  };
+})();
+</script>`;
+
+  // Insert the patch right before the main bundle script tag
   result = result.replace(
-    /<script>\(\(\)=>\{function i\(\)\{for[\s\S]*?<\/script>/g,
-    "",
+    /(<script[^>]*data-framer-bundle="main"[^>]*>)/,
+    routerPatch + "$1",
   );
 
   return result;
@@ -316,8 +327,8 @@ async function clonePage(browser, pagePath) {
   const allPaths = [...clonedPages, ...pageQueue];
   content = rewriteHtml(content, assetUrlMap, allPaths, getPageDepth(pagePath));
 
-  // Strip Framer SPA scripts so the static SSR HTML stays intact
-  content = stripFramerSpa(content);
+  // Patch Framer scripts: keep JS for animations, disable SPA router
+  content = patchFramerScripts(content);
 
   // Save
   const filename = pagePathToFile(pagePath);
@@ -424,6 +435,53 @@ async function main() {
   }
 
   await browser.close();
+
+  // Post-process downloaded JS bundles: download any framer assets referenced
+  // inside them (fonts, images) and rewrite the URLs to local paths.
+  console.log("\nPost-processing JS bundles...");
+  const assetsDir = path.join(OUTPUT_DIR, "assets");
+  const mjsFiles = [];
+  async function findMjs(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await findMjs(full);
+      else if (entry.name.endsWith(".mjs")) mjsFiles.push(full);
+    }
+  }
+  await findMjs(assetsDir).catch(() => {});
+
+  for (const mjsFile of mjsFiles) {
+    let content = await fs.readFile(mjsFile, "utf-8");
+    const framerUrls = findFramerUrls(content);
+    if (framerUrls.length === 0) continue;
+
+    // Download any new assets found in the JS
+    const urlMap = new Map();
+    for (const u of framerUrls) {
+      urlMap.set(u, await downloadAsset(u));
+    }
+
+    // Rewrite URLs — JS files live under assets/sites/<id>/, so we need a
+    // relative path from there to the asset (e.g. ../../images/ABC.webp)
+    const mjsDir = path.dirname(mjsFile);
+    const relToOutput = path.relative(mjsDir, OUTPUT_DIR);
+    const sorted = [...urlMap.entries()].sort(
+      (a, b) => b[0].length - a[0].length,
+    );
+    for (const [original, local] of sorted) {
+      content = content.split(original).join(relToOutput + "/" + local);
+    }
+
+    // Stub the editor bar import
+    content = content.replace(
+      /import\("https:\/\/edit\.framer\.com\/init\.mjs"\)/g,
+      "Promise.resolve({createEditorBar:()=>()=>null})",
+    );
+
+    await fs.writeFile(mjsFile, content);
+  }
+  console.log(`  Processed ${mjsFiles.length} JS bundles`);
 
   console.log(`\n✓ Clone complete!`);
   console.log(`  Pages cloned: ${clonedPages.size}`);
