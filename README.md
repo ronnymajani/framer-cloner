@@ -26,7 +26,7 @@ I needed to move a Framer site to static hosting and quickly discovered there ar
 ## Setup
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/ronnymajani/framer-cloner
 cd framer-cloner
 npm install
 ```
