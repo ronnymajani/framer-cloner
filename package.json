@@ -4,9 +4,7 @@
   "description": "Clone any Framer website into a fully static, self-contained site",
   "main": "clone_framer_puppeteer.js",
   "scripts": {
-    "clone": "node clone_framer_puppeteer.js"
-  },
-  "dependencies": {
-    "puppeteer": "^21.11.0"
+    "clone": "node clone_framer_puppeteer.js",
+    "serve": "node serve.js"
   }
 }

@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 
 // Framer Cloner — Clone any Framer website into a fully static, self-contained site.
+//
+// Uses the raw server-rendered HTML (not a headless browser). Framer fully SSR-renders
+// all content including CMS data, so the HTML is complete. By preserving the SSR HTML,
+// React hydration works correctly and Framer Motion animations are retained.
+//
 // Usage: node clone_framer_puppeteer.js <url>
 
-const puppeteer = require("puppeteer");
 const fs = require("fs").promises;
 const path = require("path");
 const https = require("https");
@@ -23,7 +27,7 @@ if (!siteUrl) {
 }
 
 const parsed = new URL(siteUrl);
-const BASE_URL = parsed.origin; // e.g. https://extractom.com.tr
+const BASE_URL = parsed.origin;
 const escapedBaseUrl = BASE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // Derive output directory: out/<host_with_underscores> (append _2, _3, etc. if it exists)
@@ -50,12 +54,37 @@ try {
 // State
 // ---------------------------------------------------------------------------
 const downloadedAssets = new Map(); // framer url -> local relative path
-const clonedPages = new Set(); // page paths already cloned
-const pageQueue = []; // pages waiting to be cloned
+const clonedPages = new Set();
+const pageQueue = [];
 
 // ---------------------------------------------------------------------------
-// Helpers
+// HTTP helpers
 // ---------------------------------------------------------------------------
+
+function fetchUrl(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https") ? https : http;
+    client
+      .get(url, (res) => {
+        if (
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location
+        ) {
+          return fetchUrl(res.headers.location).then(resolve).catch(reject);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+        }
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+        res.on("error", reject);
+      })
+      .on("error", reject);
+  });
+}
 
 async function downloadFile(url, filepath) {
   const dir = path.dirname(filepath);
@@ -91,10 +120,10 @@ async function downloadFile(url, filepath) {
   });
 }
 
-/**
- * Map a framerusercontent.com URL to a local path under assets/.
- * Query params (e.g. ?scale-down-to=512) are encoded into the filename.
- */
+// ---------------------------------------------------------------------------
+// Asset helpers
+// ---------------------------------------------------------------------------
+
 function getLocalAssetPath(framerUrl) {
   const u = new URL(framerUrl);
   const pathname = u.pathname;
@@ -126,13 +155,15 @@ async function downloadAsset(url) {
   return localPath;
 }
 
-function findFramerUrls(html) {
+function findFramerUrls(text) {
   const re = /https:\/\/framerusercontent\.com\/[^"'\s)}\]>]+/g;
-  const matches = html.match(re) || [];
-  // Filter out bare directory URLs (ending with /) — they're base URL references,
-  // not downloadable files, and would conflict with actual file paths.
+  const matches = text.match(re) || [];
   return [...new Set(matches)].filter((u) => !u.endsWith("/"));
 }
+
+// ---------------------------------------------------------------------------
+// Page path helpers
+// ---------------------------------------------------------------------------
 
 function pagePathToFile(pagePath) {
   if (pagePath === "/") return "index.html";
@@ -144,15 +175,10 @@ function getPageDepth(pagePath) {
   return pagePath.replace(/^\//, "").split("/").length - 1;
 }
 
-/**
- * Scan the rendered HTML for internal links and return page paths.
- * Handles both relative (href="./path") and absolute (href="https://domain/path") links.
- */
 function discoverLinks(html) {
   const paths = new Set();
   let m;
 
-  // Relative links: href="./something"
   const relRe = /href="\.\/([^"#]*?)"/g;
   while ((m = relRe.exec(html)) !== null) {
     const p = m[1];
@@ -160,14 +186,12 @@ function discoverLinks(html) {
     paths.add("/" + p);
   }
 
-  // Absolute links on the same domain: href="https://example.com/something"
   const absRe = new RegExp(`href="${escapedBaseUrl}(/[^"#]*?)"`, "g");
   while ((m = absRe.exec(html)) !== null) {
     const p = m[1];
     if (p && p !== "/") paths.add(p);
   }
 
-  // Also catch the root absolute link
   const rootRe = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
   while ((m = rootRe.exec(html)) !== null) {
     paths.add("/");
@@ -176,9 +200,6 @@ function discoverLinks(html) {
   return [...paths];
 }
 
-/**
- * Enqueue a page path for cloning if it hasn't been cloned or queued yet.
- */
 function enqueue(pagePath) {
   if (clonedPages.has(pagePath)) return;
   if (pageQueue.includes(pagePath)) return;
@@ -186,14 +207,14 @@ function enqueue(pagePath) {
 }
 
 // ---------------------------------------------------------------------------
-// Rewrite HTML
+// HTML rewriting
 // ---------------------------------------------------------------------------
 
 function rewriteHtml(html, assetUrlMap, allPagePaths, depth) {
   const prefix = depth > 0 ? "../".repeat(depth) : "./";
   let result = html;
 
-  // 1. Framer asset URLs → local (longest first to avoid partial matches)
+  // 1. Framer asset URLs → local (longest first)
   const sorted = [...assetUrlMap.entries()].sort(
     (a, b) => b[0].length - a[0].length,
   );
@@ -201,31 +222,27 @@ function rewriteHtml(html, assetUrlMap, allPagePaths, depth) {
     result = result.split(original).join(prefix + local);
   }
 
-  // 2. Internal page links → .html (longest path first to avoid partial matches)
+  // 2. Internal page links → .html (longest path first)
   const sortedPaths = [...allPagePaths].sort((a, b) => b.length - a.length);
   for (const pagePath of sortedPaths) {
     const clean = pagePath.replace(/^\//, "");
     if (!clean) continue;
 
-    // Relative links: href="./path" → href="./path.html"
     result = result
       .split(`href="./${clean}"`)
       .join(`href="${prefix}${clean}.html"`);
 
-    // Absolute same-domain links: href="https://example.com/path" → href="./path.html"
     result = result
       .split(`href="${BASE_URL}/${clean}"`)
       .join(`href="${prefix}${clean}.html"`);
   }
 
   // 3. Root links
-  //    Relative: href="./" → index.html
   result = result.replace(/href="\.\/"/g, `href="${prefix}index.html"`);
-  //    Absolute: href="https://example.com/" and href="https://example.com"
-  const rootWithSlash = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
-  result = result.replace(rootWithSlash, `href="${prefix}index.html"`);
+  const rootRe = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
+  result = result.replace(rootRe, `href="${prefix}index.html"`);
 
-  // 4. Anchor links on root: href="./#x" → index.html#x
+  // 4. Anchor links on root
   result = result.replace(
     /href="\.\/(#[^"]+)"/g,
     `href="${prefix}index.html$1"`,
@@ -235,79 +252,82 @@ function rewriteHtml(html, assetUrlMap, allPagePaths, depth) {
 }
 
 // ---------------------------------------------------------------------------
-// Patch Framer scripts — keep the JS bundle for animations but disable the
-// SPA router so navigation uses normal browser page loads (.html files).
+// Patch Framer scripts — keep JS for animations, disable SPA router
 // ---------------------------------------------------------------------------
 
 function patchFramerScripts(html) {
   let result = html;
 
-  // Remove Framer analytics / events script (not needed for static clone)
+  // Remove Framer analytics
   result = result.replace(
     /<script[^>]*src="https:\/\/events\.framer\.com\/[^"]*"[^>]*><\/script>/g,
     "",
   );
 
-  // Remove the editor bar import (https://edit.framer.com/init.mjs) — it's only
-  // for the Framer in-browser editor and will fail on a static host.
+  // Three-part injection that runs early in <head>:
+  // 1. Intercept fetch for .framercms CMS data files — return valid empty binary
+  //    (4 zero bytes = uint32 count of 0 items). These files are CloudFront-protected
+  //    and unavailable locally. SSR HTML already has all rendered CMS content.
+  // 2. Capture-phase click interceptor — forces full page loads for cross-page links,
+  //    running BEFORE the Framer SPA router can intercept and try client-side navigation.
+  // 3. pushState override as fallback for programmatic navigation.
+  const routerPatch = `<script>(function(){` +
+    // Fetch interceptor for CMS data
+    `var _f=window.fetch;window.fetch=function(u,o){` +
+    `var s=typeof u==="string"?u:u&&u.url||"";` +
+    `if(s.indexOf(".framercms")!==-1){` +
+    `return Promise.resolve(new Response(new ArrayBuffer(4),{status:200,headers:{"content-type":"application/octet-stream"}}))}` +
+    `return _f.call(this,u,o)};` +
+    // Capture-phase click interceptor — runs before SPA router
+    `document.addEventListener("click",function(e){` +
+    `var a=e.target.closest("a");if(!a)return;` +
+    `var h=a.getAttribute("href");if(!h||h.startsWith("#"))return;` +
+    `try{var u=new URL(h,location.href);` +
+    `if(u.origin===location.origin&&u.pathname!==location.pathname){` +
+    `e.preventDefault();e.stopPropagation();location.href=h}` +
+    `}catch(x){}},true);` +
+    // pushState override as fallback
+    `var p=history.pushState;history.pushState=function(s,t,u){` +
+    `if(u){var n=new URL(u,location.href);` +
+    `if(n.pathname!==location.pathname){location.href=u;return}}` +
+    `p.call(this,s,t,u)}` +
+    `})()</script>`;
+
+  // Inject early in <head> so it runs before any module scripts
+  result = result.replace("<head>", "<head>" + routerPatch);
+
+  // Fix locale redirect script: new URL(e) on relative hrefs needs a base
   result = result.replace(
-    /import\("https:\/\/edit\.framer\.com\/init\.mjs"\)/g,
-    "Promise.resolve({createEditorBar:()=>()=>null})",
+    /let t=new URL\(e\)/g,
+    "let t=new URL(e,location.href)",
   );
-
-  // Inject a small script BEFORE the main Framer bundle that disables the SPA
-  // router. Framer's router uses history.pushState to intercept navigation.
-  // By overriding pushState/replaceState to do a real page load instead, clicks
-  // on <a> tags fall through to normal browser navigation hitting our .html files.
-  const routerPatch = `<script>
-(function() {
-  // Let the Framer bundle hydrate for animations, but intercept any SPA
-  // navigation so the browser does a real page load to our .html files.
-  var origPush = history.pushState;
-  var origReplace = history.replaceState;
-  history.pushState = function(state, title, url) {
-    if (url && typeof url === 'string') {
-      window.location.href = url;
-      return;
-    }
-    origPush.call(this, state, title, url);
-  };
-  history.replaceState = function(state, title, url) {
-    if (url && typeof url === 'string' && url !== window.location.href) {
-      window.location.href = url;
-      return;
-    }
-    origReplace.call(this, state, title, url);
-  };
-})();
-</script>`;
-
-  // Insert the patch right before the main bundle script tag
   result = result.replace(
-    /(<script[^>]*data-framer-bundle="main"[^>]*>)/,
-    routerPatch + "$1",
+    /new URL\(r\)\.hostname/g,
+    "new URL(r,location.href).hostname",
   );
 
   return result;
 }
 
 // ---------------------------------------------------------------------------
-// Clone a single page
+// Clone a single page (HTTP fetch — preserves SSR HTML for hydration)
 // ---------------------------------------------------------------------------
 
-async function clonePage(browser, pagePath) {
+async function clonePage(pagePath) {
   if (clonedPages.has(pagePath)) return;
   clonedPages.add(pagePath);
 
-  const page = await browser.newPage();
   const url = BASE_URL + pagePath;
   console.log(`\nCloning: ${url}`);
 
-  await page.setViewport({ width: 1920, height: 1080 });
-  await page.goto(url, { waitUntil: "networkidle0", timeout: 60000 });
-  await page.waitForTimeout(3000);
-
-  let content = await page.content();
+  let content;
+  try {
+    content = await fetchUrl(url);
+  } catch (err) {
+    console.error(`  Failed to fetch: ${err.message}`);
+    clonedPages.delete(pagePath);
+    return;
+  }
 
   // Discover & enqueue linked pages
   for (const link of discoverLinks(content)) {
@@ -317,7 +337,7 @@ async function clonePage(browser, pagePath) {
     }
   }
 
-  // Download framer assets
+  // Download framer assets referenced in the HTML
   const framerUrls = findFramerUrls(content);
   console.log(`  Assets: ${framerUrls.length}`);
 
@@ -326,11 +346,11 @@ async function clonePage(browser, pagePath) {
     assetUrlMap.set(u, await downloadAsset(u));
   }
 
-  // Rewrite (using all pages known so far — will be fixed up later)
+  // Rewrite URLs (pages known so far — finalized later)
   const allPaths = [...clonedPages, ...pageQueue];
   content = rewriteHtml(content, assetUrlMap, allPaths, getPageDepth(pagePath));
 
-  // Patch Framer scripts: keep JS for animations, disable SPA router
+  // Patch Framer scripts for static hosting
   content = patchFramerScripts(content);
 
   // Save
@@ -339,8 +359,6 @@ async function clonePage(browser, pagePath) {
   await fs.mkdir(path.dirname(filepath), { recursive: true });
   await fs.writeFile(filepath, content);
   console.log(`  Saved: ${filename}`);
-
-  await page.close();
 }
 
 // ---------------------------------------------------------------------------
@@ -354,33 +372,6 @@ async function main() {
 
   await fs.mkdir(OUTPUT_DIR, { recursive: true });
 
-  // Try local Chrome first (bundled Chromium may be too old for newer macOS),
-  // then fall back to Puppeteer's bundled Chromium.
-  const chromeArgs = ["--no-sandbox", "--disable-setuid-sandbox"];
-  const chromePaths = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  ];
-  const localChrome = chromePaths.find((p) => {
-    try {
-      require("fs").accessSync(p);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-
-  const launchOptions = {
-    headless: "new",
-    args: chromeArgs,
-  };
-  if (localChrome) {
-    launchOptions.executablePath = localChrome;
-    console.log(`Using: ${localChrome}`);
-  }
-
-  const browser = await puppeteer.launch(launchOptions);
-
   // Seed with the homepage — every reachable page will be discovered from there
   enqueue("/");
 
@@ -388,7 +379,7 @@ async function main() {
   while (pageQueue.length > 0) {
     const pagePath = pageQueue.shift();
     try {
-      await clonePage(browser, pagePath);
+      await clonePage(pagePath);
     } catch (err) {
       console.error(`Error cloning ${pagePath}: ${err.message}`);
     }
@@ -405,27 +396,23 @@ async function main() {
       const depth = getPageDepth(pagePath);
       const prefix = depth > 0 ? "../".repeat(depth) : "./";
 
-      // Fix links that point to pages discovered after this page was first written
       const sortedPaths = [...allPaths].sort((a, b) => b.length - a.length);
       for (const otherPath of sortedPaths) {
         const clean = otherPath.replace(/^\//, "");
         if (!clean) continue;
 
-        // Relative
         content = content
           .split(`href="./${clean}"`)
           .join(`href="${prefix}${clean}.html"`);
 
-        // Absolute same-domain
         content = content
           .split(`href="${BASE_URL}/${clean}"`)
           .join(`href="${prefix}${clean}.html"`);
       }
 
-      // Root & anchor links
       content = content.replace(/href="\.\/"/g, `href="${prefix}index.html"`);
-      const rootWithSlash = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
-      content = content.replace(rootWithSlash, `href="${prefix}index.html"`);
+      const rootRe = new RegExp(`href="${escapedBaseUrl}/?"`, "g");
+      content = content.replace(rootRe, `href="${prefix}index.html"`);
       content = content.replace(
         /href="\.\/(#[^"]+)"/g,
         `href="${prefix}index.html$1"`,
@@ -437,10 +424,8 @@ async function main() {
     }
   }
 
-  await browser.close();
-
-  // Post-process downloaded JS bundles: download any framer assets referenced
-  // inside them (fonts, images) and rewrite the URLs to local paths.
+  // Post-process downloaded JS bundles: download assets referenced inside them
+  // (fonts, images) and rewrite URLs to local paths.
   console.log("\nPost-processing JS bundles...");
   const assetsDir = path.join(OUTPUT_DIR, "assets");
   const mjsFiles = [];
@@ -456,33 +441,107 @@ async function main() {
 
   for (const mjsFile of mjsFiles) {
     let content = await fs.readFile(mjsFile, "utf-8");
+    let modified = false;
+
+    // Download and rewrite any framerusercontent.com URLs (images, fonts)
     const framerUrls = findFramerUrls(content);
-    if (framerUrls.length === 0) continue;
+    if (framerUrls.length > 0) {
+      const urlMap = new Map();
+      for (const u of framerUrls) {
+        urlMap.set(u, await downloadAsset(u));
+      }
 
-    // Download any new assets found in the JS
-    const urlMap = new Map();
-    for (const u of framerUrls) {
-      urlMap.set(u, await downloadAsset(u));
+      const mjsDir = path.dirname(mjsFile);
+      const relToOutput = path.relative(mjsDir, OUTPUT_DIR);
+      const sorted = [...urlMap.entries()].sort(
+        (a, b) => b[0].length - a[0].length,
+      );
+      for (const [original, local] of sorted) {
+        content = content.split(original).join(relToOutput + "/" + local);
+      }
+      modified = true;
     }
 
-    // Rewrite URLs — JS files live under assets/sites/<id>/, so we need a
-    // relative path from there to the asset (e.g. ../../images/ABC.webp)
-    const mjsDir = path.dirname(mjsFile);
-    const relToOutput = path.relative(mjsDir, OUTPUT_DIR);
-    const sorted = [...urlMap.entries()].sort(
-      (a, b) => b[0].length - a[0].length,
-    );
-    for (const [original, local] of sorted) {
-      content = content.split(original).join(relToOutput + "/" + local);
+    // Stub the editor bar import (fails on static hosts, crashes hydration)
+    if (content.includes("edit.framer.com")) {
+      content = content.replace(
+        /import\("https:\/\/edit\.framer\.com\/init\.mjs"\)/g,
+        "Promise.resolve({createEditorBar:()=>()=>null})",
+      );
+      modified = true;
     }
 
-    // Stub the editor bar import
-    content = content.replace(
-      /import\("https:\/\/edit\.framer\.com\/init\.mjs"\)/g,
-      "Promise.resolve({createEditorBar:()=>()=>null})",
-    );
+    // Fix new URL("./file.framercms","../relative/base") — the second arg
+    // must be absolute. Wrap with new URL(base, import.meta.url) so it
+    // resolves correctly when served from any host.
+    if (/new URL\("\.\/[^"]+","\.\.\//.test(content)) {
+      content = content.replace(
+        /new URL\("(\.\/.+?)","(\.\.\/.+?)"\)/g,
+        'new URL("$1",new URL("$2",import.meta.url))',
+      );
+      modified = true;
+    }
 
-    await fs.writeFile(mjsFile, content);
+    // Make CMS scanItems fail gracefully (returns [] on fetch error instead
+    // of crashing React). CMS data is only needed for SPA navigation which
+    // we've disabled; SSR HTML already has all rendered content.
+    if (content.includes("scanItems()")) {
+      // Pattern: return s}),this.itemsPromise} → return s}).catch(()=>[]),this.itemsPromise}
+      content = content.replace(
+        /return (\w)\}\),this\.itemsPromise\}/g,
+        "return $1}).catch(()=>[]),this.itemsPromise}",
+      );
+      // Variant with double-paren (Promise.all pattern)
+      content = content.replace(
+        /return (\w)\}\)\),this\.itemsPromise\}/g,
+        "return $1})).catch(()=>[]),this.itemsPromise}",
+      );
+      modified = true;
+    }
+
+    // Make CMS batch/range fetch fail gracefully instead of throwing
+    if (/\.status!==200\)throw Error/.test(content)) {
+      content = content.replace(
+        /if\((\w+)\.status!==200\)throw Error\([^)]+\)/g,
+        "if($1.status!==200)return e.map(()=>({pointer:\"\",data:{}}))",
+      );
+      modified = true;
+    }
+
+    // Make compression dictionary fetch fail gracefully (returns null instead
+    // of throwing). Some CMS chunks use a compression dictionary for data;
+    // when unavailable, returning null lets the code degrade gracefully.
+    if (content.includes("Compression dictionary request failed")) {
+      content = content.replace(
+        /if\(!(\w+)\.ok\)throw Error\(`Compression dictionary request failed[^`]*`\)/g,
+        "if(!$1.ok)return null",
+      );
+      modified = true;
+    }
+
+    // Wrap CMS loadModel in try-catch so index fetch/parse errors don't crash React.
+    // Pattern: async loadModel(){BODY}async getModel()
+    if (content.includes("async loadModel(){")) {
+      content = content.replace(
+        /async loadModel\(\)\{(.*?)\}(async getModel\(\))/g,
+        "async loadModel(){try{$1}catch(e){return null}}$2",
+      );
+      modified = true;
+    }
+
+    // Wrap CMS lookupItems in try-catch so query errors return empty instead of crashing.
+    // Pattern: async lookupItems(ARGS){BODY}queryEquals(
+    if (content.includes("async lookupItems(")) {
+      content = content.replace(
+        /async lookupItems\((\w+)\)\{(.*?)\}(queryEquals\()/g,
+        "async lookupItems($1){try{$2}catch(e){return[]}}$3",
+      );
+      modified = true;
+    }
+
+    if (modified) {
+      await fs.writeFile(mjsFile, content);
+    }
   }
   console.log(`  Processed ${mjsFiles.length} JS bundles`);
 
@@ -490,7 +549,7 @@ async function main() {
   console.log(`  Pages cloned: ${clonedPages.size}`);
   console.log(`  Assets downloaded: ${downloadedAssets.size}`);
   console.log(`\nTo serve locally:`);
-  console.log(`  cd ${OUTPUT_DIR} && python3 -m http.server 8000`);
+  console.log(`  npm run serve`);
 }
 
 main().catch(console.error);
